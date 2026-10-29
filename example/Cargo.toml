@@ -9,6 +9,6 @@ axum = "0.8.9"
 hyper-fast-path = { path = "../hyper-fast-path" }
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1.53", features = ["macros", "net", "rt-multi-thread"] }
-tower-http = { version = "0.7", features = ["fs", "set-status", "trace"] }
+tower-http = { version = "0.7", features = ["fs", "set-header", "set-status", "trace"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }

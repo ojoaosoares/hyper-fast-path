@@ -89,9 +89,13 @@ struct PreparedRoute {
     h2: Option<H2Response>,
 }
 
-/// Returns the value of the `Content-Type` header to serve `file` with, based
-/// on its extension.
-fn content_type(file: &Path) -> &'static str {
+/// Returns the value of the `Content-Type` header to serve `file` with: the
+/// one forced on every asset if there is one, else one based on its extension.
+fn content_type<'a>(file: &Path, forced: Option<&'a str>) -> &'a str {
+    if let Some(content_type) = forced {
+        return content_type;
+    }
+
     match file.extension().and_then(|ext| ext.to_str()) {
         Some("html") => "text/html; charset=utf-8",
         Some("js") => "application/javascript",
@@ -103,14 +107,14 @@ fn content_type(file: &Path) -> &'static str {
 
 /// Renders the full HTTP/1.1 response (status line, headers and body) that
 /// the fast path will serve verbatim whenever `path` is requested.
-fn render_response(file: &Path) -> Result<Vec<u8>> {
+fn render_response(file: &Path, forced_content_type: Option<&str>) -> Result<Vec<u8>> {
     let body = std::fs::read(file)
         .with_context(|| format!("failed to read fastpath asset {}", file.display()))?;
 
     let mut resp = format!(
         "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: {}\r\nConnection: keep-alive\r\n\r\n",
         body.len(),
-        content_type(file),
+        content_type(file, forced_content_type),
     )
     .into_bytes();
     resp.extend_from_slice(&body);
@@ -149,7 +153,10 @@ fn h2_frame(kind: u8, flags: u8, payload: &[u8]) -> Vec<u8> {
 /// The body's length is returned alongside them: it is the part of the response
 /// that is flow controlled, and so what the fast path has to have room for in
 /// the client's windows before it may answer with it.
-fn render_h2_response(file: &Path) -> Result<(Vec<u8>, Vec<u32>, usize)> {
+fn render_h2_response(
+    file: &Path,
+    forced_content_type: Option<&str>,
+) -> Result<(Vec<u8>, Vec<u32>, usize)> {
     let body = std::fs::read(file)
         .with_context(|| format!("failed to read fastpath asset {}", file.display()))?;
 
@@ -157,7 +164,7 @@ fn render_h2_response(file: &Path) -> Result<(Vec<u8>, Vec<u32>, usize)> {
     // as an indexed field
     let mut hdrs = vec![0x88];
     hdrs.extend_from_slice(&hpack_literal(28, &body.len().to_string()));
-    hdrs.extend_from_slice(&hpack_literal(31, content_type(file)));
+    hdrs.extend_from_slice(&hpack_literal(31, content_type(file, forced_content_type)));
 
     let mut resp = h2_frame(0x01, 0x04, &hdrs); // HEADERS, END_HEADERS
 
@@ -197,12 +204,22 @@ impl<'obj> FastPath<'obj> {
     /// `dummies` is the number of connections the fast path runs on at once,
     /// each of which takes up a loopback connection of its own. Connections
     /// beyond that are served by userspace alone.
+    ///
+    /// `content_type`, if set, is the `Content-Type` every response is
+    /// rendered with instead of the one guessed from the file's extension.
     pub fn attach<A: ToSocketAddrs>(
         address: A,
         open_obj: &'obj mut MaybeUninit<libbpf_rs::OpenObject>,
         routes: HashMap<String, PathBuf>,
         dummies: usize,
+        content_type: Option<&str>,
     ) -> Result<Self> {
+        // HPACK spells the value's length out in a single byte, see
+        // `hpack_literal`
+        if content_type.is_some_and(|content_type| content_type.len() > 126) {
+            bail!("a Content-Type of more than 126 bytes is not supported");
+        }
+
         if dummies == 0 || dummies > MAX_DUMMIES {
             bail!("the fast path runs on 1 to {MAX_DUMMIES} connections, {dummies} requested");
         }
@@ -227,7 +244,7 @@ impl<'obj> FastPath<'obj> {
             // a response too large to pre-render is left to the server rather
             // than refused: a path the fast path does not know is one it passes
             // on, which is exactly what should happen to it
-            let body = render_response(file)?;
+            let body = render_response(file, content_type)?;
             if body.len() > MAX_ROUTE_BODY {
                 let len = body.len();
                 info!("Not serving `{path}` from the fast path, {len}B exceeds {MAX_ROUTE_BODY}B");
@@ -240,7 +257,7 @@ impl<'obj> FastPath<'obj> {
             // the HTTP/2 rendering carries a frame header every
             // `MAX_FRAME_SIZE` bytes, so it can outgrow the HTTP/1.1 one by
             // enough to no longer fit
-            let (h2_body, sid_offs, data_len) = render_h2_response(file)?;
+            let (h2_body, sid_offs, data_len) = render_h2_response(file, content_type)?;
             let fits = h2_body.len() <= MAX_ROUTE_BODY && sid_offs.len() <= MAX_SID_OFFS;
             let h2 = match fits {
                 false => {

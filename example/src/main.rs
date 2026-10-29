@@ -6,6 +6,7 @@ use hyper_fast_path::{
     listener::BeeperListener,
     server,
 };
+use axum::http::{HeaderValue, header::CONTENT_TYPE};
 use clap::Parser;
 use std::{
     collections::HashMap,
@@ -13,7 +14,9 @@ use std::{
     path::{Path, PathBuf},
 };
 use tokio::net::TcpListener;
-use tower_http::{services::ServeDir, trace::TraceLayer};
+use tower_http::{
+    services::ServeDir, set_header::SetResponseHeaderLayer, trace::TraceLayer,
+};
 use tracing_subscriber::EnvFilter;
 
 /// The assets served with the fast path unless told otherwise.
@@ -56,6 +59,11 @@ struct Args {
         default_values_t = DEFAULT_ROUTES.iter().map(|route| route.to_string())
     )]
     routes: Vec<String>,
+
+    /// The `Content-Type` every asset is served with, by the fast path and
+    /// user space alike, instead of the one guessed from its extension.
+    #[arg(long)]
+    content_type: Option<HeaderValue>,
 }
 
 /// All assets that are served with the fast path.
@@ -86,6 +94,10 @@ async fn main() {
 
     let app = axum::Router::new()
         .fallback_service(serve_dir)
+        .layer(SetResponseHeaderLayer::overriding(
+            CONTENT_TYPE,
+            args.content_type.clone(),
+        ))
         .layer(TraceLayer::new_for_http());
 
     // the fast path has to outlive the server, and nothing of it is loaded
@@ -96,7 +108,15 @@ async fn main() {
         None
     } else {
         let routes = fastpath_routes(&assets_dir, &args.routes);
-        Some(FastPath::attach(args.addr, &mut open_obj, routes, args.dummies).expect("attach"))
+        let content_type = args.content_type.as_ref().map(|value| {
+            value
+                .to_str()
+                .expect("Content-Type is not visible ASCII")
+        });
+        Some(
+            FastPath::attach(args.addr, &mut open_obj, routes, args.dummies, content_type)
+                .expect("attach"),
+        )
     };
 
     let listener = TcpListener::bind(args.addr).await.unwrap();
