@@ -13,7 +13,7 @@ use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
 };
-use tokio::net::TcpListener;
+use tokio::net::TcpSocket;
 use tower_http::{
     services::ServeDir, set_header::SetResponseHeaderLayer, trace::TraceLayer,
 };
@@ -64,6 +64,11 @@ struct Args {
     /// user space alike, instead of the one guessed from its extension.
     #[arg(long)]
     content_type: Option<HeaderValue>,
+
+    /// The most connections the kernel queues up for the server to accept.
+    /// Capped at `net.core.somaxconn`.
+    #[arg(long, default_value_t = 1024)]
+    backlog: u32,
 }
 
 /// All assets that are served with the fast path.
@@ -119,7 +124,15 @@ async fn main() {
         )
     };
 
-    let listener = TcpListener::bind(args.addr).await.unwrap();
+    let socket = match args.addr {
+        SocketAddr::V4(_) => TcpSocket::new_v4(),
+        SocketAddr::V6(_) => TcpSocket::new_v6(),
+    }
+    .unwrap();
+    // what `TcpListener::bind` would have done, but with a backlog of our own
+    socket.set_reuseaddr(true).unwrap();
+    socket.bind(args.addr).unwrap();
+    let listener = socket.listen(args.backlog).unwrap();
     let listener = BeeperListener::new(listener);
     tracing::debug!("listening on {}", listener.local_addr().unwrap());
 
