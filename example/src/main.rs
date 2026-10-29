@@ -7,10 +7,25 @@ use hyper_fast_path::{
     server,
 };
 use clap::Parser;
-use std::{collections::HashMap, net::SocketAddr, path::PathBuf};
+use std::{
+    collections::HashMap,
+    net::SocketAddr,
+    path::{Path, PathBuf},
+};
 use tokio::net::TcpListener;
 use tower_http::{services::ServeDir, trace::TraceLayer};
 use tracing_subscriber::EnvFilter;
+
+/// The assets served with the fast path unless told otherwise.
+const DEFAULT_ROUTES: &[&str] = &[
+    "/1KB.txt",
+    "/8KB.txt",
+    "/16KB.txt",
+    "/32KB.txt",
+    "/48KB.txt",
+    "/64KB.txt",
+    "/128KB.txt",
+];
 
 /// A static file server that can answer its smaller assets from eBPF.
 #[derive(Parser)]
@@ -27,25 +42,32 @@ struct Args {
     /// The number of connections the fast path runs on at once.
     #[arg(long, default_value_t = fast_path::DEFAULT_DUMMIES)]
     dummies: usize,
+
+    /// The directory the assets are served from. Defaults to the example's own
+    /// `assets` directory.
+    #[arg(long)]
+    assets_dir: Option<PathBuf>,
+
+    /// The request paths served with the fast path, comma separated. Each one
+    /// names a file relative to the assets directory.
+    #[arg(
+        long,
+        value_delimiter = ',',
+        default_values_t = DEFAULT_ROUTES.iter().map(|route| route.to_string())
+    )]
+    routes: Vec<String>,
 }
 
 /// All assets that are served with the fast path.
-fn fastpath_routes(assets_dir: &str) -> HashMap<String, PathBuf> {
-    [
-        "/1KB.txt",
-        "/8KB.txt",
-        "/16KB.txt",
-        "/32KB.txt",
-        "/48KB.txt",
-        "/64KB.txt",
-        "/128KB.txt",
-    ]
-    .into_iter()
-    .map(|path| {
-        let file = PathBuf::from(format!("{assets_dir}{path}"));
-        (path.to_string(), file)
-    })
-    .collect()
+fn fastpath_routes(assets_dir: &Path, routes: &[String]) -> HashMap<String, PathBuf> {
+    routes
+        .iter()
+        .map(|path| {
+            // a request path is absolute, a file in the assets directory is not
+            let file = assets_dir.join(path.trim_start_matches('/'));
+            (path.to_string(), file)
+        })
+        .collect()
 }
 
 #[tokio::main]
@@ -56,8 +78,11 @@ async fn main() {
         .with_env_filter(EnvFilter::from_default_env())
         .init();
 
-    let assets_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/assets");
-    let serve_dir = ServeDir::new(assets_dir);
+    let assets_dir = args
+        .assets_dir
+        .clone()
+        .unwrap_or_else(|| PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/assets")));
+    let serve_dir = ServeDir::new(&assets_dir);
 
     let app = axum::Router::new()
         .fallback_service(serve_dir)
@@ -70,7 +95,7 @@ async fn main() {
         tracing::info!("Running without the eBPF fast path");
         None
     } else {
-        let routes = fastpath_routes(assets_dir);
+        let routes = fastpath_routes(&assets_dir, &args.routes);
         Some(FastPath::attach(args.addr, &mut open_obj, routes, args.dummies).expect("attach"))
     };
 
