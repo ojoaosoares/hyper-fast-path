@@ -44,6 +44,14 @@ const MAX_DUMMIES: usize = 16384;
 const ARENA_BASE: usize = 1 << 44;
 const PAGE_SIZE: usize = 4096;
 
+/// The smallest send buffer a connection on the fast path is given, see
+/// `sndbuf` in fast_path.bpf.c.
+const MIN_SNDBUF: usize = 1 << 20;
+
+/// How many of its largest responses a connection's send buffer has room for.
+/// One may still be waiting to be acknowledged when the next is redirected in.
+const SNDBUF_RESPONSES: usize = 4;
+
 /// The number of connections the fast path runs on at once unless told
 /// otherwise, see [`FastPath::attach`].
 pub const DEFAULT_DUMMIES: usize = 1024;
@@ -388,6 +396,20 @@ impl<'obj> FastPath<'obj> {
 
         open_skel.maps.rodata_data.as_mut().unwrap().ip4 = ip4;
         open_skel.maps.rodata_data.as_mut().unwrap().port = address.port() as u32;
+
+        // the kernel doubles what it is asked for and caps it at
+        // `net.core.wmem_max`, so this is a lower bound rather than the size
+        let largest = prepared
+            .iter()
+            .map(|route| {
+                let h2_len = route.h2.as_ref().map_or(0, |h2| h2.body.len());
+                route.body.len().max(h2_len)
+            })
+            .max()
+            .unwrap_or(0);
+        let sndbuf = (SNDBUF_RESPONSES * largest).max(MIN_SNDBUF);
+        open_skel.maps.rodata_data.as_mut().unwrap().sndbuf = sndbuf as u32;
+        debug!("Giving every fast path connection a {sndbuf}B send buffer");
 
         // the parsers are only attached once the program is loaded, but the
         // ids they hand out for their captures have to be in its rodata by

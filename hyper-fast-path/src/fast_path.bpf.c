@@ -142,6 +142,24 @@ struct {
 volatile const u32 ip4;
 volatile const u32 port;
 
+// The send buffer every connection on the fast path gets, set by user space
+// before the program is loaded. 0 leaves it to the kernel's autotuning.
+//
+// A response the fast path answers with is redirected into the client's
+// socket, which cannot wait for room the way a sendmsg can. If the send buffer
+// still holds the previous response's unacknowledged bytes when the next
+// request arrives, the redirect fails and the connection breaks. The default
+// buffer starts at `tcp_wmem[1]` (16KB) and only grows over time, which large
+// responses outrun on a real link.
+volatile const u32 sndbuf;
+
+#ifndef SOL_SOCKET
+#define SOL_SOCKET 1
+#endif
+#ifndef SO_SNDBUF
+#define SO_SNDBUF 7
+#endif
+
 // The matches the parsers are configured with, set by user space to the ids
 // beeper handed out for them before the program is loaded.
 volatile const u8 h1_preface_mid;
@@ -1237,6 +1255,13 @@ static __always_inline void add_conn(struct bpf_sock_ops *ops, struct ip4_conn *
 
     // the dummy has to be given back once the connection closes
     if (bpf_sock_ops_cb_flags_set(ops, BPF_SOCK_OPS_STATE_CB_FLAG) < 0) goto release;
+
+    if (sndbuf > 0) {
+        int val = sndbuf;
+        if (bpf_setsockopt(ops, SOL_SOCKET, SO_SNDBUF, &val, sizeof(val)) < 0) {
+            bpf_warn("Failed to set the send buffer of [%pI4:%u->%pI4:%u]", &key->remote.ip4, key->remote.port, &key->local.ip4, key->local.port);
+        }
+    }
 
     if (bpf_sock_hash_update(ops, &sock_map, key, BPF_ANY) < 0) {
         bpf_error("Failed to add socket [%pI4:%u->%pI4:%u]", &key->local.ip4, key->local.port, &key->remote.ip4, key->remote.port);
