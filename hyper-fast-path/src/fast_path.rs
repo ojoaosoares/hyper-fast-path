@@ -57,7 +57,6 @@ pub const DEFAULT_DUMMIES: usize = 1024;
 pub struct FastPath<'obj> {
     #[allow(dead_code)]
     dummies: DummyPool,
-    #[allow(dead_code)]
     skel: FastPathSkel<'obj>,
     #[allow(dead_code)]
     sockops: Link,
@@ -65,6 +64,84 @@ pub struct FastPath<'obj> {
     h1: h1::AttachedParser,
     #[allow(dead_code)]
     h2: h2::AttachedParser,
+}
+
+/// What became of the connections and requests the fast path saw since it was
+/// attached, see [`FastPath::stats`].
+///
+/// The fields mirror `struct fp_stats` in fast_path.bpf.c, in the same order.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Stats {
+    /// Connections that ran through the fast path.
+    pub conns_added: u64,
+    /// Connections that found no dummy left, and so were served by user space
+    /// alone. Raise the number of dummies if this is not zero.
+    pub conns_no_dummy: u64,
+    /// HTTP/1.1 requests answered from the fast path.
+    pub served_h1: u64,
+    /// HTTP/2 requests answered from the fast path.
+    pub served_h2: u64,
+    /// Requests for a path the fast path has no response for.
+    pub no_route: u64,
+    /// Requests for a pre-rendered response that the fast path could not
+    /// serve, and so left to user space.
+    pub serve_failed: u64,
+    /// Messages the fast path dropped.
+    pub dropped: u64,
+    /// Messages handed to user space.
+    pub to_user: u64,
+}
+
+impl Stats {
+    /// The number of counters, i.e. of `u64`s in `struct fp_stats`.
+    const LEN: usize = 8;
+
+    /// The counters along with their names, in the order of `struct fp_stats`.
+    pub fn fields(&self) -> [(&'static str, u64); Self::LEN] {
+        [
+            ("conns_added", self.conns_added),
+            ("conns_no_dummy", self.conns_no_dummy),
+            ("served_h1", self.served_h1),
+            ("served_h2", self.served_h2),
+            ("no_route", self.no_route),
+            ("serve_failed", self.serve_failed),
+            ("dropped", self.dropped),
+            ("to_user", self.to_user),
+        ]
+    }
+
+    /// Adds up the per-CPU copies of `struct fp_stats`.
+    fn sum(per_cpu: &[Vec<u8>]) -> Self {
+        let mut sums = [0u64; Self::LEN];
+        for value in per_cpu {
+            for (i, sum) in sums.iter_mut().enumerate() {
+                let bytes = &value[i * 8..(i + 1) * 8];
+                *sum += u64::from_ne_bytes(bytes.try_into().unwrap());
+            }
+        }
+
+        let [
+            conns_added,
+            conns_no_dummy,
+            served_h1,
+            served_h2,
+            no_route,
+            serve_failed,
+            dropped,
+            to_user,
+        ] = sums;
+
+        Self {
+            conns_added,
+            conns_no_dummy,
+            served_h1,
+            served_h2,
+            no_route,
+            serve_failed,
+            dropped,
+            to_user,
+        }
+    }
 }
 
 unsafe impl<'obj> Send for FastPath<'obj> {}
@@ -458,5 +535,19 @@ impl<'obj> FastPath<'obj> {
             h1,
             h2,
         })
+    }
+
+    /// Returns what became of the connections and requests the fast path saw
+    /// since it was attached.
+    pub fn stats(&self) -> Result<Stats> {
+        let per_cpu = self
+            .skel
+            .maps
+            .stats
+            .lookup_percpu(&0u32.to_ne_bytes(), MapFlags::ANY)
+            .context("failed to read the fast path's stats")?
+            .context("the fast path's stats are missing")?;
+
+        Ok(Stats::sum(&per_cpu))
     }
 }

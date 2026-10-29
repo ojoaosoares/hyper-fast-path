@@ -13,7 +13,10 @@ use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
 };
-use tokio::net::TcpSocket;
+use tokio::{
+    net::TcpSocket,
+    signal::unix::{SignalKind, signal},
+};
 use tower_http::{
     services::ServeDir, set_header::SetResponseHeaderLayer, trace::TraceLayer,
 };
@@ -69,6 +72,11 @@ struct Args {
     /// Capped at `net.core.somaxconn`.
     #[arg(long, default_value_t = 1024)]
     backlog: u32,
+
+    /// A file to write the fast path's stats to as `name,value` lines once the
+    /// server is stopped with SIGINT or SIGTERM.
+    #[arg(long)]
+    stats_file: Option<PathBuf>,
 }
 
 /// All assets that are served with the fast path.
@@ -108,7 +116,7 @@ async fn main() {
     // the fast path has to outlive the server, and nothing of it is loaded
     // unless it was asked for
     let mut open_obj = OpenObject::new();
-    let _fastpath = if args.no_fastpath {
+    let fastpath = if args.no_fastpath {
         tracing::info!("Running without the eBPF fast path");
         None
     } else {
@@ -136,5 +144,26 @@ async fn main() {
     let listener = BeeperListener::new(listener);
     tracing::debug!("listening on {}", listener.local_addr().unwrap());
 
-    server::serve(listener, app).await;
+    let mut terminate = signal(SignalKind::terminate()).unwrap();
+    tokio::select! {
+        _ = server::serve(listener, app) => {}
+        _ = tokio::signal::ctrl_c() => {}
+        _ = terminate.recv() => {}
+    }
+
+    let Some(fastpath) = fastpath else {
+        return;
+    };
+
+    let stats = fastpath.stats().expect("stats");
+    tracing::info!("Fast path stats: {stats:?}");
+
+    if let Some(stats_file) = &args.stats_file {
+        let lines: String = stats
+            .fields()
+            .iter()
+            .map(|(name, value)| format!("{name},{value}\n"))
+            .collect();
+        std::fs::write(stats_file, lines).expect("write stats");
+    }
 }

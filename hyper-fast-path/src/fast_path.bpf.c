@@ -101,6 +101,43 @@ struct {
     __type(value, struct dummy_owner);
 } dummy_owners SEC(".maps");
 
+// What became of the connections and messages the fast path saw, so that a
+// benchmark can tell how much of the load it actually answered. Kept per CPU
+// so that counting costs no cross-CPU traffic, and summed by user space, see
+// `FastPath::stats`. The field order is mirrored there.
+struct fp_stats {
+    // connections that were lent a dummy, and so run through the fast path
+    u64 conns_added;
+    // connections that found no dummy left and are served by user space alone
+    u64 conns_no_dummy;
+    // requests answered from the fast path, per protocol
+    u64 served_h1;
+    u64 served_h2;
+    // requests for a path without a pre-rendered response
+    u64 no_route;
+    // requests for a pre-rendered response that could not be served, e.g. as
+    // it did not fit the client's window or the message could not be grown
+    u64 serve_failed;
+    // messages dropped, whether half rewritten or left without a connection
+    u64 dropped;
+    // messages handed to user space
+    u64 to_user;
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, u32);
+    __type(value, struct fp_stats);
+} stats SEC(".maps");
+
+#define STAT_INC(field)                                         \
+    do {                                                        \
+        u32 __zero = 0;                                         \
+        struct fp_stats *__s = bpf_map_lookup_elem(&stats, &__zero); \
+        if (__s) __s->field++;                                  \
+    } while (0)
+
 // The address of the server, set by user space before the program is loaded.
 volatile const u32 ip4;
 volatile const u32 port;
@@ -867,18 +904,23 @@ static __always_inline int try_serve_route(struct sk_msg_md *msg, struct ip4_con
     u8 *idx = bpf_map_lookup_elem(&route_idx, &key);
     if (!idx) {
         bpf_warn("No route found for request path");
+        STAT_INC(no_route);
         return -1;
     };
 
     u32 i = *idx;
     bpf_clamp_uminmax(i, 0, MAX_ROUTES - 1);
 
-    return serve_route(msg, ikey, &routes[i], sid, req_len);
+    int res = serve_route(msg, ikey, &routes[i], sid, req_len);
+    if (res == -1) STAT_INC(serve_failed);
+
+    return res;
 }
 
 // Hands the next `len` bytes the client sent to user space, which may reach
 // past the end of `msg`, see `dummy_map`.
 static __always_inline int to_user_space(struct sk_msg_md *msg, struct ip4_conn *conn, u32 len) {
+    STAT_INC(to_user);
     bpf_msg_apply_bytes(msg, len);
 
     return bpf_msg_redirect_hash(msg, &sock_map, conn, BPF_F_INGRESS);
@@ -923,11 +965,17 @@ int msg_verdict(struct sk_msg_md *msg) {
     };
 
     u32 *dummy = bpf_map_lookup_elem(&dummy_idx, &dkey);
-    if (!dummy) return SK_DROP;
+    if (!dummy) {
+        STAT_INC(dropped);
+        return SK_DROP;
+    }
 
     struct dummy_owner *owner = bpf_map_lookup_elem(&dummy_owners, dummy);
     // what is left over from a connection that closed has nowhere to go
-    if (!owner || !owner->active) return SK_DROP;
+    if (!owner || !owner->active) {
+        STAT_INC(dropped);
+        return SK_DROP;
+    }
 
     // socket identifier of the client connection
     struct ip4_conn ikey = owner->conn;
@@ -1038,11 +1086,15 @@ int msg_verdict(struct sk_msg_md *msg) {
         int served = try_serve_route(msg, &ikey, &path, sid, msg_len);
         if (served < -1) {
             bpf_error("Failed to serve request, dropping it");
+            STAT_INC(dropped);
             return SK_DROP;
         }
 
         if (served == 0) {
             bpf_debug("Served request");
+
+            if (is_h2) STAT_INC(served_h2);
+            else STAT_INC(served_h1);
 
             // user space knows nothing of this request, and the header block
             // just decoded may well have changed the dynamic table, so the
@@ -1075,6 +1127,7 @@ int msg_verdict(struct sk_msg_md *msg) {
             // letting the message through now would have user space decode it
             // against a table that no longer matches the client's, which
             // desyncs HPACK for good. cutting the connection is the lesser evil.
+            STAT_INC(dropped);
             return SK_DROP;
         }
 
@@ -1148,7 +1201,10 @@ int skb_verdict(struct __sk_buff *skb) {
     // a socket is only added once it holds a dummy, and only loses it once it
     // is closed
     u32 *dummy = bpf_map_lookup_elem(&conn_dummy, &ikey);
-    if (!dummy) return SK_DROP;
+    if (!dummy) {
+        STAT_INC(dropped);
+        return SK_DROP;
+    }
 
     // the end of the stream arrives as an empty sk_buff. the backlog takes
     // sending nothing for a broken pipe, which would leave the dummy unusable
@@ -1171,6 +1227,7 @@ static __always_inline void add_conn(struct bpf_sock_ops *ops, struct ip4_conn *
     u32 dummy;
     if (bpf_map_pop_elem(&free_dummies, &dummy) < 0) {
         bpf_warn("No dummy left for [%pI4:%u->%pI4:%u], leaving it to user space", &key->remote.ip4, key->remote.port, &key->local.ip4, key->local.port);
+        STAT_INC(conns_no_dummy);
         return;
     }
 
@@ -1187,6 +1244,7 @@ static __always_inline void add_conn(struct bpf_sock_ops *ops, struct ip4_conn *
     }
 
     bpf_debug("Added socket [%pI4:%u->%pI4:%u] with dummy %u", &key->local.ip4, key->local.port, &key->remote.ip4, key->remote.port, dummy);
+    STAT_INC(conns_added);
 
     return;
 
