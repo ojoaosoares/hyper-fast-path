@@ -12,3 +12,10 @@ tokio = { version = "1.53", features = ["macros", "net", "rt-multi-thread", "sig
 tower-http = { version = "0.7", features = ["fs", "set-header", "set-status", "trace"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+ktls = "6"
+tokio-rustls = "0.26"
+rustls-pemfile = "2"
+rustls = { version = "0.23", features = ["tls12"] }
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+tower = { version = "0.5", features = ["util"] }

@@ -13,10 +13,12 @@ use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
 };
+use std::sync::Arc;
 use tokio::{
-    net::TcpSocket,
+    net::{TcpListener, TcpSocket},
     signal::unix::{SignalKind, signal},
 };
+use tokio_rustls::TlsAcceptor;
 use tower_http::{
     services::ServeDir, set_header::SetResponseHeaderLayer, trace::TraceLayer,
 };
@@ -77,6 +79,88 @@ struct Args {
     /// server is stopped with SIGINT or SIGTERM.
     #[arg(long)]
     stats_file: Option<PathBuf>,
+
+    /// Serve HTTP/1.1 over TLS 1.2 (ECDHE-ECDSA-AES128-GCM-SHA256) with this
+    /// PEM certificate, handing the session to kTLS once the handshake is done.
+    #[arg(long, requires = "tls_key")]
+    tls_cert: Option<PathBuf>,
+
+    /// The PEM private key of `--tls-cert`.
+    #[arg(long, requires = "tls_cert")]
+    tls_key: Option<PathBuf>,
+}
+
+/// TLS 1.2 with the one cipher suite kTLS and the benchmark's other servers
+/// share, its secrets extractable for kTLS.
+fn tls_acceptor(cert: &Path, key: &Path) -> TlsAcceptor {
+    use rustls::crypto::aws_lc_rs;
+
+    let certs = rustls_pemfile::certs(&mut std::io::BufReader::new(
+        std::fs::File::open(cert).expect("open TLS certificate"),
+    ))
+    .collect::<Result<Vec<_>, _>>()
+    .expect("read TLS certificate");
+    let key = rustls_pemfile::private_key(&mut std::io::BufReader::new(
+        std::fs::File::open(key).expect("open TLS key"),
+    ))
+    .expect("read TLS key")
+    .expect("no private key in the TLS key file");
+
+    let provider = rustls::crypto::CryptoProvider {
+        cipher_suites: vec![aws_lc_rs::cipher_suite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256],
+        ..aws_lc_rs::default_provider()
+    };
+    let mut config = rustls::ServerConfig::builder_with_provider(Arc::new(provider))
+        .with_protocol_versions(&[&rustls::version::TLS12])
+        .expect("TLS 1.2")
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .expect("TLS certificate and key");
+    config.enable_secret_extraction = true;
+    TlsAcceptor::from(Arc::new(config))
+}
+
+/// Serves `app` over TLS on `listener`: rustls does the handshake, kTLS
+/// everything after it, and the connection is plain HTTP/1.1 to the server.
+/// The fast path sees the connection from the moment the kernel accepted it.
+async fn serve_tls(listener: TcpListener, acceptor: TlsAcceptor, app: axum::Router) {
+    use axum::{body::Body, extract::Request};
+    use tower::ServiceExt;
+
+    loop {
+        let (tcp, peer) = match listener.accept().await {
+            Ok(conn) => conn,
+            Err(e) => {
+                tracing::error!("failed to accept a connection: {e}");
+                continue;
+            }
+        };
+        let _ = tcp.set_nodelay(true);
+        let acceptor = acceptor.clone();
+        let app = app.clone();
+
+        tokio::spawn(async move {
+            let tls = match acceptor.accept(ktls::CorkStream::new(tcp)).await {
+                Ok(tls) => tls,
+                Err(e) => return tracing::debug!("TLS handshake with {peer} failed: {e}"),
+            };
+            let stream = match ktls::config_ktls_server(tls).await {
+                Ok(stream) => stream,
+                Err(e) => return tracing::error!("kTLS setup for {peer} failed: {e}"),
+            };
+
+            let service = hyper::service::service_fn(move |req: Request<hyper::body::Incoming>| {
+                let app = app.clone();
+                async move { app.oneshot(req.map(Body::new)).await }
+            });
+            if let Err(e) = hyper::server::conn::http1::Builder::new()
+                .serve_connection(hyper_util::rt::TokioIo::new(stream), service)
+                .await
+            {
+                tracing::debug!("connection from {peer} ended: {e}");
+            }
+        });
+    }
 }
 
 /// All assets that are served with the fast path.
@@ -141,14 +225,26 @@ async fn main() {
     socket.set_reuseaddr(true).unwrap();
     socket.bind(args.addr).unwrap();
     let listener = socket.listen(args.backlog).unwrap();
-    let listener = BeeperListener::new(listener);
     tracing::debug!("listening on {}", listener.local_addr().unwrap());
 
     let mut terminate = signal(SignalKind::terminate()).unwrap();
-    tokio::select! {
-        _ = server::serve(listener, app) => {}
-        _ = tokio::signal::ctrl_c() => {}
-        _ = terminate.recv() => {}
+    match (&args.tls_cert, &args.tls_key) {
+        (Some(cert), Some(key)) => {
+            let acceptor = tls_acceptor(cert, key);
+            tokio::select! {
+                _ = serve_tls(listener, acceptor, app) => {}
+                _ = tokio::signal::ctrl_c() => {}
+                _ = terminate.recv() => {}
+            }
+        }
+        _ => {
+            let listener = BeeperListener::new(listener);
+            tokio::select! {
+                _ = server::serve(listener, app) => {}
+                _ = tokio::signal::ctrl_c() => {}
+                _ = terminate.recv() => {}
+            }
+        }
     }
 
     let Some(fastpath) = fastpath else {
