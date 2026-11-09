@@ -197,7 +197,7 @@ fn render_response(file: &Path, forced_content_type: Option<&str>) -> Result<Vec
         .with_context(|| format!("failed to read fastpath asset {}", file.display()))?;
 
     let mut resp = format!(
-        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: {}\r\nConnection: keep-alive\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nServer: xbench\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n",
         body.len(),
         content_type(file, forced_content_type),
     )
